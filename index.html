@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#172033">
+  <title>ホバークラフト Proコン操作</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { margin: 0 auto; max-width: 720px; padding: 18px; line-height: 1.5; }
+    h1 { font-size: 1.45rem; }
+    .card { border: 1px solid #8886; border-radius: 14px; padding: 14px; margin: 12px 0; }
+    button { font: inherit; font-weight: 650; padding: 12px 16px; border: 0; border-radius: 10px; margin: 4px 0; width: 100%; }
+    .primary { background: #2868d7; color: white; }
+    .stop { background: #a32929; color: white; }
+    .status { font-weight: 650; }
+    code { overflow-wrap: anywhere; }
+    .muted { opacity: .78; font-size: .93rem; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <h1>ホバークラフト Proコン操作</h1>
+  <p class="muted">プロコンをAndroidのBluetooth設定でペアリングし、このページをChromeで開いてください。操縦確認は、ファンの電源を切った状態から始めてください。</p>
+
+  <section class="card">
+    <h2>1. 接続</h2>
+    <button id="connect" class="primary">XIAO-HOVER にBLE接続</button>
+    <button id="disconnect">BLE切断・停止命令</button>
+    <p id="bleStatus" class="status">BLE: 未接続</p>
+    <p id="padStatus" class="status">プロコン: 未検出</p>
+  </section>
+
+  <section class="card">
+    <h2>2. 操作</h2>
+    <p><b>Lボタン</b>：リフトファンをON（押している間）</p>
+    <p><b>ZRトリガー</b>：推進ファンをON（押している間）</p>
+    <p><b>右スティック左右</b>：サーボを60～120度で操作</p>
+    <p id="live" class="status">送信値: リフトOFF / 推進OFF / サーボ90°</p>
+    <p class="muted">停止のため、ボタンを離すとそのファンはOFFになります。ブラウザを閉じたりBLE接続が切れたりした場合も、XIAO側で通信タイムアウトによりファンを停止します。</p>
+  </section>
+
+  <section class="card">
+    <h2>入力チェック</h2>
+    <p class="muted">プロコンが検出されない場合は、AndroidのBluetooth設定で接続されているか確認してください。ボタン番号やスティック軸が違う場合、下の情報を確認して割り当てを調整します。</p>
+    <pre id="debug">ゲームパッド情報なし</pre>
+  </section>
+
+<script>
+const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+
+// Standard Gamepad mapping: L = button 4, ZR = button 7, right-stick X = axis 2.
+// If your controller reports non-standard mapping, use the debug box to adjust these.
+const LIFT_BUTTON = 4;
+const THRUST_BUTTON = 7;
+const RIGHT_STICK_X_AXIS = 2;
+
+let device = null;
+let commandCharacteristic = null;
+let isSending = false;
+let latestCommand = { lift: 0, thrust: 0, angle: 90 };
+
+const bleStatus = document.getElementById('bleStatus');
+const padStatus = document.getElementById('padStatus');
+const live = document.getElementById('live');
+const debug = document.getElementById('debug');
+
+function showBleStatus(message) { bleStatus.textContent = 'BLE: ' + message; }
+
+async function connectBle() {
+  if (!('bluetooth' in navigator)) {
+    showBleStatus('このブラウザはWeb Bluetoothに対応していません。ChromeでHTTPSのページを開いてください。');
+    return;
+  }
+  try {
+    showBleStatus('デバイス選択待ち…');
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: 'XIAO-HOVER' }],
+      optionalServices: [SERVICE_UUID]
+    });
+    device.addEventListener('gattserverdisconnected', () => {
+      commandCharacteristic = null;
+      showBleStatus('切断されました。XIAO側でファンはタイムアウト停止します。');
+    });
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    commandCharacteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
+    showBleStatus('接続中 (' + device.name + ')');
+  } catch (error) {
+    commandCharacteristic = null;
+    showBleStatus('接続失敗: ' + error.message);
+  }
+}
+
+async function disconnectBle() {
+  // Send one explicit neutral command before disconnecting when possible.
+  if (commandCharacteristic) {
+    try {
+      await commandCharacteristic.writeValue(new TextEncoder().encode('0,0,90'));
+    } catch (_) {}
+  }
+  commandCharacteristic = null;
+  if (device && device.gatt && device.gatt.connected) device.gatt.disconnect();
+  showBleStatus('切断済み');
+}
+
+document.getElementById('connect').addEventListener('click', connectBle);
+document.getElementById('disconnect').addEventListener('click', disconnectBle);
+
+function pressed(gamepad, index) {
+  const button = gamepad.buttons[index];
+  return !!button && (button.pressed || button.value > 0.25);
+}
+
+function pollGamepad() {
+  const pads = (navigator.getGamepads && navigator.getGamepads()) || [];
+  const gamepad = Array.from(pads).find(p => p && p.connected);
+
+  if (!gamepad) {
+    padStatus.textContent = 'プロコン: 未検出';
+    latestCommand = { lift: 0, thrust: 0, angle: 90 };
+    debug.textContent = 'ゲームパッド情報なし';
+    live.textContent = '送信値: リフトOFF / 推進OFF / サーボ90°';
+    return;
+  }
+
+  padStatus.textContent = 'プロコン: 検出 (' + gamepad.id + ')';
+  const lift = pressed(gamepad, LIFT_BUTTON) ? 1 : 0;
+  const thrust = pressed(gamepad, THRUST_BUTTON) ? 1 : 0;
+  const axis = Number.isFinite(gamepad.axes[RIGHT_STICK_X_AXIS]) ? gamepad.axes[RIGHT_STICK_X_AXIS] : 0;
+  const centeredAxis = Math.abs(axis) < 0.12 ? 0 : axis;
+  const angle = Math.max(60, Math.min(120, Math.round(90 + centeredAxis * 30)));
+  latestCommand = { lift, thrust, angle };
+
+  live.textContent = '送信値: リフト' + (lift ? 'ON' : 'OFF') +
+    ' / 推進' + (thrust ? 'ON' : 'OFF') + ' / サーボ' + angle + '°';
+  debug.textContent = 'ID: ' + gamepad.id + '\nMapping: ' + (gamepad.mapping || '(standard以外/未指定)') +
+    '\nButtons: ' + gamepad.buttons.map((b, i) => i + ':' + (b.pressed ? '押下' : b.value.toFixed(2))).join('  ') +
+    '\nAxes: ' + gamepad.axes.map((v, i) => i + ':' + v.toFixed(2)).join('  ');
+}
+
+// Send a fresh command periodically. If the gamepad disappears, send neutral values.
+setInterval(async () => {
+  pollGamepad();
+  if (!commandCharacteristic || isSending) return;
+  isSending = true;
+  try {
+    const c = latestCommand;
+    const bytes = new TextEncoder().encode(`${c.lift},${c.thrust},${c.angle}`);
+    if (commandCharacteristic.writeValueWithResponse) {
+      await commandCharacteristic.writeValueWithResponse(bytes);
+    } else {
+      await commandCharacteristic.writeValue(bytes);
+    }
+  } catch (error) {
+    showBleStatus('送信エラー: ' + error.message);
+  } finally {
+    isSending = false;
+  }
+}, 100);
+
+window.addEventListener('gamepadconnected', event => {
+  padStatus.textContent = 'プロコン: 接続イベント (' + event.gamepad.id + ')';
+});
+window.addEventListener('gamepaddisconnected', () => {
+  latestCommand = { lift: 0, thrust: 0, angle: 90 };
+  padStatus.textContent = 'プロコン: 切断';
+});
+</script>
+</body>
+</html>
